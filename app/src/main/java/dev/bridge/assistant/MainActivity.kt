@@ -21,6 +21,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import dev.bridge.assistant.assistant.ScreenBuffer
 import dev.bridge.assistant.assistant.WakeWordService
+import dev.bridge.assistant.assistant.WakeEvents
 import dev.bridge.assistant.assistant.WakeModelInstaller
 import dev.bridge.assistant.core.Actions
 import dev.bridge.assistant.core.CommandParser
@@ -37,6 +38,9 @@ class MainActivity : Activity() {
     private var recognizer: SpeechRecognizer? = null
     private val io = Executors.newSingleThreadExecutor()
     private var pendingWakePermission = false
+    private var activatedByWake = false
+    private var rearmOnResume = false
+    private var activityResumed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -119,6 +123,7 @@ class MainActivity : Activity() {
             confirmSelectedScreen()
         }
         if (intent.getBooleanExtra("auto_voice", false)) {
+            activatedByWake = true
             android.os.Handler(mainLooper).postDelayed({ startSpeech() }, 400)
         }
         if (auth.accountLabel != "Not connected") refreshModels()
@@ -185,7 +190,32 @@ class MainActivity : Activity() {
             confirmSelectedScreen()
         }
         if (intent.getBooleanExtra("auto_voice", false)) {
+            activatedByWake = true
             android.os.Handler(mainLooper).postDelayed({ startSpeech() }, 400)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+        if (rearmOnResume) {
+            rearmOnResume = false
+            resumeWakeDetection()
+        }
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        super.onPause()
+    }
+
+    private fun resumeWakeDetection() {
+        if (!activatedByWake) return
+        activatedByWake = false
+        try {
+            startService(Intent(this, WakeWordService::class.java).setAction(WakeEvents.ACTION_RESUME))
+        } catch (e: Exception) {
+            status.text = "Включите Open GPT повторно: ${e.message}"
         }
     }
 
@@ -245,12 +275,32 @@ class MainActivity : Activity() {
                 override fun onRmsChanged(rmsdB: Float) { }
                 override fun onBufferReceived(buffer: ByteArray?) { }
                 override fun onEndOfSpeech() { status.text = "Processing speech…" }
-                override fun onError(error: Int) { status.text = "Speech recognition error $error" }
+                override fun onError(error: Int) {
+                    status.text = "Speech recognition error $error"
+                    this@MainActivity.recognizer?.destroy()
+                    this@MainActivity.recognizer = null
+                    resumeWakeDetection()
+                }
                 override fun onResults(results: Bundle?) {
                     val words = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    val transcript = words?.firstOrNull() ?: return
+                    val transcript = words?.firstOrNull()
+                    if (transcript == null) {
+                        resumeWakeDetection()
+                        return
+                    }
                     input.setText(transcript)
+                    this@MainActivity.recognizer?.destroy()
+                    this@MainActivity.recognizer = null
+                    val local = CommandParser.parse(transcript)
+                    if (activatedByWake && local is LocalCommand.Call) rearmOnResume = true
                     executeCommand(transcript)
+                    if (!rearmOnResume) resumeWakeDetection()
+                    else android.os.Handler(mainLooper).postDelayed({
+                        if (activityResumed && rearmOnResume) {
+                            rearmOnResume = false
+                            resumeWakeDetection()
+                        }
+                    }, 1600)
                 }
                 override fun onPartialResults(partialResults: Bundle?) { }
                 override fun onEvent(eventType: Int, params: Bundle?) { }

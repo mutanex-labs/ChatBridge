@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 object WakeEvents {
     const val ACTION_WAKE = "dev.bridge.assistant.WAKE_DETECTED"
     const val ACTION_STOP = "dev.bridge.assistant.WAKE_STOP"
+    const val ACTION_RESUME = "dev.bridge.assistant.WAKE_RESUME"
     const val CHANNEL = "wake_foreground"
     const val NOTIFICATION_ID = 19
 }
@@ -111,8 +112,15 @@ class WakeWordService : Service() {
             }
             microphone = null
             running.set(false)
-            if (triggered) sendBroadcast(Intent(WakeEvents.ACTION_WAKE).setPackage(packageName))
-            stopSelf()
+            if (triggered) {
+                getSystemService(NotificationManager::class.java).notify(WakeEvents.NOTIFICATION_ID,
+                    Notification.Builder(this, WakeEvents.CHANNEL)
+                        .setContentTitle("Open GPT · пауза на время команды")
+                        .setContentText("Микрофон освобождён. Распознавание возобновится после команды.")
+                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                        .setOngoing(true).build())
+                sendBroadcast(Intent(WakeEvents.ACTION_WAKE).setPackage(packageName))
+            } else stopSelf()
         }
     }
 
