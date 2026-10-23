@@ -1,0 +1,7 @@
+# Device acceptance (not executed)
+
+Android Studio debug-build should pass `assembleDebug` and `testDebugUnitTest` with no runtime permissions hardcoded. Install on Xiaomi / HyperOS Android 16, request assistant role, verify role is held before attempting wake activation. Run a local wake-only trial with screen unlocked and another with the screen locked; confirm whether VoiceInteractionService launches UI under the OEM's restrictions. Measure standby drain with wake disabled and enabled; check microphone app-ops and notification/stop behavior. Repeat ten normal phrases with varied noise to record false positives. Check that recognized wake immediately releases the foreground microphone before Android's voice recognizer begins.
+
+Test screenshot lasso on a plain webpage, an image and a FLAG_SECURE screen. Ensure the mask matches the exact selected pixels, corner clipping remains in bounds, and screenshot submission always requires affirmative consent. After kill/restart, old screenshot content must not be shown.
+
+Test Xiaomi Notes `ACTION_SEND` resolution on the user's exact installed package and version. Confirm that text is populated in a new note, not a previous existing note, and independently verify persistence by reopening Xiaomi Notes after the save. If no handler is exported, fall back to chooser and explicitly state that direct save is unsupported on this device. Do not mark this acceptance criterion passed without the on-device check.

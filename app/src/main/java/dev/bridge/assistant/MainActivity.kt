@@ -3,6 +3,8 @@ package dev.bridge.assistant
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.role.RoleManager
+import android.net.Uri
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -18,6 +20,8 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import dev.bridge.assistant.assistant.ScreenBuffer
+import dev.bridge.assistant.assistant.WakeWordService
+import dev.bridge.assistant.assistant.WakeModelInstaller
 import dev.bridge.assistant.core.Actions
 import dev.bridge.assistant.core.CommandParser
 import dev.bridge.assistant.core.LocalCommand
@@ -32,6 +36,7 @@ class MainActivity : Activity() {
     private var modelIds = emptyList<String>()
     private var recognizer: SpeechRecognizer? = null
     private val io = Executors.newSingleThreadExecutor()
+    private var pendingWakePermission = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -72,16 +77,116 @@ class MainActivity : Activity() {
         button("Run command") { executeCommand(input.text.toString()) }
         button("Speak command") { startSpeech() }
         button("Ask GPT about current screen") {
-            val image = ScreenBuffer.bitmap
-            if (image == null) status.text = "No screenshot available from Android assistant invocation"
-            else AlertDialog.Builder(this)
-                .setTitle("Send screenshot to GPT?")
-                .setMessage("The current screen image will be sent to OpenAI for this request only. Do not include sensitive data.")
-                .setPositiveButton("Send") { _, _ -> askGpt(input.text.toString().ifBlank { "Объясни, что показано на экране" }, true) }
-                .setNegativeButton("Cancel", null).show()
+            confirmSelectedScreen()
         }
-        root.addView(label("Screen access depends on Android/OEM and the foreground app. Voice wake word is not available in this prototype."))
+        root.addView(label("Open GPT: локальная офлайн-активация, включается вручную. Микрофон работает постоянно, расходует батарею."))
+        button("Назначить GPT Bridge системным ассистентом") {
+            val manager = getSystemService(RoleManager::class.java)
+            if (manager.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
+                startActivityForResult(manager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT), 104)
+            } else status.text = "Эта прошивка не предоставляет роль ассистента через RoleManager"
+        }
+        button("Скачать офлайн-модель Vosk (~40 МБ)") {
+            AlertDialog.Builder(this).setTitle("Загрузить модель Open GPT?")
+                .setMessage("Загрузка около 40 МБ с alphacephei.com. Проверка SHA-256 и распаковка в приватное хранилище. Потребуется около 200 МБ свободного места.")
+                .setPositiveButton("Загрузить") { _, _ ->
+                    status.text = "Загрузка и проверка модели…"
+                    io.execute {
+                        try {
+                            WakeModelInstaller.downloadSmallEnglish(applicationContext)
+                            runOnUiThread { status.text = "Модель готова: можно включать Open GPT" }
+                        } catch (e: Exception) {
+                            runOnUiThread { status.text = "Загрузка модели: ${e.message}" }
+                        }
+                    }
+                }.setNegativeButton("Отмена", null).show()
+        }
+        button("Импортировать офлайн-модель Vosk (ZIP)") {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/zip"
+            }
+            startActivityForResult(intent, 103)
+        }
+        button("Включить Open GPT") { enableWakeWord() }
+        button("Выключить Open GPT") {
+            stopService(Intent(this, WakeWordService::class.java))
+            status.text = "Open GPT выключен"
+        }
+        root.addView(label("Для Open GPT сначала назначьте GPT Bridge системным ассистентом и импортируйте Vosk small English model."))
+        if (intent.getBooleanExtra("screen_selection", false)) {
+            input.setText("Объясни выделенную область экрана")
+            confirmSelectedScreen()
+        }
+        if (intent.getBooleanExtra("auto_voice", false)) {
+            android.os.Handler(mainLooper).postDelayed({ startSpeech() }, 400)
+        }
         if (auth.accountLabel != "Not connected") refreshModels()
+    }
+
+    private fun confirmSelectedScreen() {
+        if (ScreenBuffer.bitmap == null) {
+            status.text = "Android не предоставил снимок экрана"
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Отправить изображение в GPT?")
+            .setMessage("Выбранная область будет отправлена в OpenAI после подтверждения. Не отправляйте личные данные.")
+            .setPositiveButton("Отправить") { _, _ ->
+                askGpt(input.text.toString().ifBlank { "Объясни, что показано на экране" }, true)
+            }
+            .setNegativeButton("Отмена", null).show()
+    }
+
+    private fun enableWakeWord() {
+        val role = getSystemService(RoleManager::class.java)
+        if (!role.isRoleAvailable(RoleManager.ROLE_ASSISTANT) || !role.isRoleHeld(RoleManager.ROLE_ASSISTANT)) {
+            status.text = "Назначьте GPT Bridge ассистентом Android, иначе голосовой вызов не сможет показать сессию"
+            return
+        }
+        if (!WakeModelInstaller.isInstalled(this)) {
+            status.text = "Сначала импортируйте ZIP-модель Vosk"
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingWakePermission = true
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 102)
+            return
+        }
+        try {
+            startForegroundService(Intent(this, WakeWordService::class.java))
+            status.text = "Open GPT включается: следите за постоянным уведомлением"
+        } catch (e: Exception) {
+            status.text = "Не удалось запустить микрофон: ${e.message}"
+        }
+    }
+
+    @Deprecated("Uses the platform activity result callback for a local ZIP import")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 103 || resultCode != RESULT_OK) return
+        val uri: Uri = data?.data ?: return
+        status.text = "Проверка и установка модели…"
+        io.execute {
+            try {
+                WakeModelInstaller.install(applicationContext, uri)
+                runOnUiThread { status.text = "Модель установлена. Можно включить Open GPT." }
+            } catch (e: Exception) {
+                runOnUiThread { status.text = "Импорт не удался: ${e.message}" }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra("screen_selection", false)) {
+            input.setText("Объясни выделенную область экрана")
+            confirmSelectedScreen()
+        }
+        if (intent.getBooleanExtra("auto_voice", false)) {
+            android.os.Handler(mainLooper).postDelayed({ startSpeech() }, 400)
+        }
     }
 
     private fun refreshModels() {
@@ -160,7 +265,12 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 102 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startSpeech()
+        if (requestCode == 102 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            if (pendingWakePermission) {
+                pendingWakePermission = false
+                enableWakeWord()
+            } else startSpeech()
+        } else if (requestCode == 102) pendingWakePermission = false
     }
 
     override fun onDestroy() {

@@ -1,37 +1,39 @@
 # GPT Android Bridge
 
-Experimental, Android 12+ (minSdk 31) system assistant shell for local commands and ChatGPT plan-backed AI requests. **Prototype, not a released or device-validated application.** No root, no remote backend, and no access to the official ChatGPT app session. Repository initially private; choose an OSI-approved license and verify compliance with OpenAI terms before open-source release.
+Experimental Android 12+ assistant, version **0.2.0**, on Kotlin. Source release only; not yet compiled with Android SDK or tested on a device. It is not an official ChatGPT client, does not inherit the native app's conversations, and has no root requirement.
 
-## What is implemented
+## Available source implementations
 
-The Android `VoiceInteractionService` registers a candidate system assistant, with a `VoiceInteractionSession` that can receive a system-provided screenshot and open the command screen. The command screen accepts typed commands or one-shot voice transcription using an Android-recognizer installed on the device. Deterministic local commands are matched before invoking any remote AI inference. `Позвони маме` searches accessible phone contacts and starts a call if `CALL_PHONE` permission is granted; ambiguous matches open a picker, and if direct-call permission is missing it opens the dialer. `Открой Telegram` launches a visible matching app. `Запиши в заметки ...` saves locally and offers Android Share; it does **not** directly write into Xiaomi Notes. The screenshot, if Android supplies one, is sent only when the user presses the screen-analysis button and explicitly confirms. Protected windows and OEM restrictions can make screenshots unavailable.
+The app registers `VoiceInteractionService` and displays a `VoiceInteractionSession`. A session can receive a system-provided screenshot, display it inside `ScreenLasso`, accept a finger-drawn closed outline, mask pixels outside that outline and forward the cropped image to GPT **only after confirmation**. The source image is held in process memory, not written to media storage. `FLAG_SECURE`, Android policy, manufacturer implementations and secure apps may prevent screenshot access.
 
-**Sign in with ChatGPT** uses the documented open-source flow: loopback callback on `127.0.0.1`, dynamic client registration, host ID, PKCE S256, state/nonce, RSA-signed ID token verification against OpenAI JWKS, grant-scope checking, encrypted tokens in Android Keystore-backed local storage, and refresh-token rotation. The model list is read from the account's `/v1/models`. GPT requests use Responses API `store:false` and `stream:true`, consume response text deltas until `response.completed`, and optionally include a user-approved screenshot. This is not connected to ChatGPT conversations or memory. OAuth or AI availability is conditional on account eligibility, consent, policy and usage limits.
+A manually enabled `WakeWordService` uses `AudioRecord` at 16-kHz/16-bit mono and local Vosk transcription to recognize `Open GPT` (and supported textual variants). When recognized, the service signals the current system assistant via an app-scoped broadcast, releases the microphone, and requests an Android assist session. That session opens the app's one-shot voice command recognizer. **Say the wake phrase and then the command after the interface starts listening.** Wake detection is one-shot and must be reenabled after a completed interaction. This avoids competing for the microphone during a call; automatic reliable rearming is not implemented. Continuous microphone processing has a significant energy and RAM cost and may be interrupted by HyperOS. This implementation is **not** a hardware hotword detector and has no measured false-accept or false-reject rates.
 
-## Not implemented
+The wake model is not committed to the source repository. An explicit button downloads the official Vosk small English model (~40MB) over HTTPS, enforces a size limit, verifies the known SHA-256 and extracts it into app-private storage, with zip-slip protection and an uncompressed size limit. Alternatively the user can import the identical ZIP file from Documents. Speech data for wake detection remains on-device. The Android one-shot recognition service that handles commands **might be network-based**, depending on the device.
 
-Always-listening `Open GPT` hotword, low-power hardware hotword detection, background calling without first opening the assistant UI, native Circle to Search-style lasso, direct Xiaomi Notes adapter, continuous streaming speech or Realtime API, model-controlled tool calling, secure multi-user account picker, automated OEM-device validation, production credential recovery, and signed releases. SIWC plan usage does not cover Realtime audio. Voice transcription depends on whichever Android speech recognition service is available and may use its own network service.
+Commands still run locally: contacts and phone calling, app launching, and a local note backup. `Запиши в заметки ...` now tries an explicit `ACTION_SEND` intent addressed to `com.miui.notes` and falls back to the system sharing chooser if no public handler is available. **Sending an intent is not proof that Xiaomi Notes saved anything.** The user must review or save the opened note when required by their Notes version. There is no documented cross-version silent-create API, and this project does not attempt private content-provider access or high-privilege accessibility automation.
 
-## Development
+`Continue with ChatGPT` is the existing open-source plan-backed Sign in with ChatGPT flow with PKCE and local encrypted token storage. The code uses supported Responses API requests for text and optional user-approved screen images; Realtime audio is not covered. OAuth availability and supported plan models depend on current eligibility. Do not put ChatGPT passwords, tokens or API keys into the repository.
 
-Open the root folder in Android Studio with Android SDK 35, JDK 17, Gradle 8.11.1 and an internet connection for Gradle dependencies. A Gradle wrapper is not bundled yet; install Gradle 8.11.1 or generate its wrapper using `gradle wrapper --gradle-version 8.11.1` before running `./gradlew`. Build with `gradle testDebugUnitTest assembleDebug`. The GitHub Actions workflow uses pinned Gradle to compile and upload a debug APK on successful checks. There is no prebuilt APK in this source archive.
+## Build and quick check
 
-Install a debug build on an Android 12+ device; open the app, grant the needed individual permissions, and test typed local commands first. For ChatGPT requests, tap **Continue with ChatGPT**, complete login and plan-sharing consent in your system browser, choose a model, and submit a prompt. For system assistant invocation, choose GPT Bridge in Android Settings → Apps → Default apps → Digital assistant; precise menu names vary by OEM. The system invocation panel currently has an **Open voice and actions** button. Testing on Xiaomi HyperOS is required before asserting compatibility.
+Import this directory into Android Studio with JDK 17, SDK 35 and Gradle 8.11.1. The Gradle wrapper is not included. Run `gradle testDebugUnitTest assembleDebug` or push to GitHub to run the included CI workflow, which also uploads a debug APK. **No successful Android compilation or Xiaomi device test has been performed here.** A passing CI build still does not prove that the assistant role, screen capture, Note intent and microphone background behavior work on HyperOS.
 
-## Boundaries
+Install to Android 12+ and open the app. Use **Назначить GPT Bridge системным ассистентом** if your system exposes the assistant role. Grant microphone, contacts and phone permissions as needed. Click **Скачать офлайн-модель Vosk**, then **Включить Open GPT**. A persistent notification indicates that the foreground service is running and includes a stop button. Say "Open GPT", then after the command interface opens say "позвони маме". To select a screen region, invoke the system assistant normally, draw a closed region in the overlay and choose **Спросить GPT о выделенном**; confirm any image transfer. To test notes, type "запиши в заметки купить молоко" and check whether Xiaomi Notes offers a populated draft.
 
-Never send contact data, screenshots, or foreground-app content to OpenAI without explicit user action. Phone calls are a direct local command, not an action an LLM may invoke. Keep OAuth tokens out of logs, crash reports, and repository history; tokens are stored encrypted locally. `CALL_PHONE`, `READ_CONTACTS` and `RECORD_AUDIO` are requested at runtime and can be denied. All external actions should be idempotent where possible and must handle ambiguous targets. Do not use an accessibility service to bypass screenshot protection or app-specific access controls. Android and OpenAI APIs can change.
+## Scope and privacy
 
-## Sources
+Foreground audio capture is opt-in, visible through a persistent notification and stopped after a successful wake event. The service does not silently start on boot. Android may refuse a microphone foreground service or delay background launch despite valid permissions. The screenshot is never automatically uploaded, and all processing on sensitive UI requires explicit consent. Phone calls are deterministic commands and are not initiated by a language-model tool call. If a contact or application is ambiguous, a local picker resolves it. The app's diagnostic logs never include recorded audio.
 
-OpenAI Sign in with ChatGPT: https://developers.openai.com/siwc/token-sharing-open-source
+## References
 
-OpenAI registration: https://developers.openai.com/siwc/token-sharing-open-source/sign-in
-
-OpenAI inference: https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference
-
-OpenAI preview limitations: https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations
+OpenAI SIWC: https://developers.openai.com/siwc/token-sharing-open-source
 
 Android VoiceInteractionSession: https://developer.android.com/reference/android/service/voice/VoiceInteractionSession
 
-This is a learning/prototype project and is not affiliated with, approved by, or endorsed by OpenAI.
+Android foreground microphone restrictions: https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start
+
+Vosk models and license: https://alphacephei.com/vosk/models.html
+
+Vosk Maven: https://central.sonatype.com/artifact/com.alphacephei/vosk-android/0.3.47
+
+This project is not affiliated with, endorsed by or approved by OpenAI or Xiaomi.

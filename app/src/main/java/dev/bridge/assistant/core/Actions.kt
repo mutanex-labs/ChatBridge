@@ -82,11 +82,15 @@ class Actions(private val activity: Activity, private val report: (String) -> Un
         val prefs = activity.getSharedPreferences("local_notes", Activity.MODE_PRIVATE)
         val old = prefs.getString("notes", "") ?: ""
         prefs.edit().putString("notes", listOf(old, body).filter { it.isNotBlank() }.joinToString("\n")).apply()
-        report("Saved locally in GPT Bridge. Xiaomi Notes is not directly integrated.")
-        AlertDialog.Builder(activity).setTitle("Share note to another app?")
-            .setMessage(body).setPositiveButton("Share") { _, _ ->
+        if (XiaomiNotes.sendToNotes(activity, body)) {
+            report("Текст отправлен в Xiaomi Notes. Проверьте экран и сохраните заметку: подтверждения записи через API нет.")
+            return
+        }
+        report("Xiaomi Notes не поддерживает доступную отправку текста. Копия сохранена локально.")
+        AlertDialog.Builder(activity).setTitle("Передать заметку другим способом?")
+            .setMessage(body).setPositiveButton("Поделиться") { _, _ ->
                 val intent = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, body) }
-                activity.startActivity(Intent.createChooser(intent, "Choose notes app"))
-            }.setNegativeButton("Keep local", null).show()
+                activity.startActivity(Intent.createChooser(intent, "Выберите приложение заметок"))
+            }.setNegativeButton("Оставить локально", null).show()
     }
 }
