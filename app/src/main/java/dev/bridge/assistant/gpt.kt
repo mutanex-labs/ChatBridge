@@ -22,12 +22,19 @@ class GptClient(private val auth: ChatGptAuth) {
     fun ask(model: String, query: String, screenshot: Bitmap? = null): String {
         val content = JSONArray().put(JSONObject().put("type", "input_text").put("text", query))
         if (screenshot != null) {
-            val resized = if (screenshot.width > 1200) {
-                Bitmap.createScaledBitmap(screenshot, 1200, screenshot.height * 1200 / screenshot.width, true)
-            } else screenshot
             val out = ByteArrayOutputStream()
-            resized.compress(Bitmap.CompressFormat.JPEG, 70, out)
-            if (resized !== screenshot) resized.recycle()
+            val longestSide = maxOf(screenshot.width, screenshot.height)
+            val resized = if (longestSide > 1200) {
+                val ratio = 1200f / longestSide
+                Bitmap.createScaledBitmap(screenshot,
+                    (screenshot.width * ratio).toInt().coerceAtLeast(1),
+                    (screenshot.height * ratio).toInt().coerceAtLeast(1), true)
+            } else screenshot
+            try {
+                check(resized.compress(Bitmap.CompressFormat.JPEG, 70, out)) { "Could not encode screenshot" }
+            } finally {
+                if (resized !== screenshot) resized.recycle()
+            }
             require(out.size() < 3_000_000) { "Screenshot too large" }
             val dataUrl = "data:image/jpeg;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
             content.put(JSONObject().put("type", "input_image").put("image_url", dataUrl))
@@ -60,8 +67,12 @@ class GptClient(private val auth: ChatGptAuth) {
                     if (data == "[DONE]") break
                     val event = JSONObject(data)
                     when (event.optString("type")) {
-                        "response.output_text.delta" -> answer.append(event.optString("delta"))
+                        "response.output_text.delta" -> {
+                            answer.append(event.optString("delta"))
+                            require(answer.length <= 1_000_000) { "Response exceeds size limit" }
+                        }
                         "response.completed" -> completed = true
+                        "response.incomplete" -> error("Model response was incomplete: ${event.toString().take(300)}")
                         "response.failed", "error" -> error("Model returned an error: ${event.toString().take(300)}")
                     }
                 }

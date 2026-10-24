@@ -9,9 +9,9 @@ import android.os.Looper
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import dev.bridge.assistant.core.OAuthProtocol
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -28,6 +28,7 @@ import java.security.spec.RSAPublicKeySpec
 import java.math.BigInteger
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -45,16 +46,49 @@ class ChatGptAuth(private val context: Context) {
     private val io = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
     private val rng = SecureRandom()
+    private val attemptActive = AtomicBoolean(false)
+    @Volatile private var activeListener: ServerSocket? = null
+    @Volatile private var closed = false
 
     val accountLabel: String
         get() = crypto.load()?.optString("email")?.takeIf { it.isNotBlank() } ?: "Not connected"
 
-    fun signOut() {
+    fun signOut(finished: (Boolean) -> Unit = {}) {
+        val session = try { crypto.load() } catch (_: Exception) { null }
         crypto.clear()
-        prefs.edit().remove("client_id").apply()
+        try {
+            io.execute {
+                val revoked = try { session?.let { revoke(it) } ?: true } catch (_: Exception) { false }
+                handler.post { if (!closed) finished(revoked) }
+            }
+        } catch (_: Exception) {
+            finished(false)
+        }
+    }
+
+    fun close() {
+        closed = true
+        activeListener?.let { try { it.close() } catch (_: Exception) { } }
+        activeListener = null
+        io.shutdownNow()
     }
 
     fun begin(activity: Activity, finished: (Result<String>) -> Unit) {
+        if (closed) { finished(Result.failure(IllegalStateException("Sign-in session is closed"))); return }
+        if (!attemptActive.compareAndSet(false, true)) {
+            finished(Result.failure(IllegalStateException("Sign-in is already in progress")))
+            return
+        }
+        val delivered = AtomicBoolean(false)
+        val complete: (Result<String>) -> Unit = { result ->
+            handler.post {
+                if (!closed && delivered.compareAndSet(false, true)) {
+                    activeListener = null
+                    attemptActive.set(false)
+                    finished(result)
+                }
+            }
+        }
         val state = random(32)
         val nonce = random(32)
         val verifier = random(48)
@@ -70,8 +104,10 @@ class ChatGptAuth(private val context: Context) {
                 soTimeout = 180_000
             }
         } catch (e: Exception) {
-            finished(Result.failure(e)); return
+            attemptActive.set(false)
+            complete(Result.failure(e)); return
         }
+        activeListener = listener
         val redirect = "http://127.0.0.1:${listener.localPort}/auth/callback"
         val fields = linkedMapOf(
             "client_id" to (existing ?: "dynamic_agent_client"),
@@ -85,7 +121,13 @@ class ChatGptAuth(private val context: Context) {
             "code_challenge_method" to "S256",
             "ext_agent_host_id" to host
         )
-        if (existing == null) fields["agent_name_hint"] = "GPT Bridge"
+        if (existing == null) fields["agent_name_hint"] = "Chabi"
+        else {
+            crypto.load()?.let { previous ->
+                previous.optString("id_token").takeIf { it.isNotBlank() }?.let { fields["id_token_hint"] = it }
+                previous.optString("email").takeIf { it.isNotBlank() }?.let { fields["login_hint"] = it }
+            }
+        }
         val url = "$AUTH?${encode(fields)}"
         io.execute {
             try {
@@ -93,13 +135,9 @@ class ChatGptAuth(private val context: Context) {
                 require(callback.getQueryParameter("state")?.let {
                     MessageDigest.isEqual(it.toByteArray(), state.toByteArray())
                 } == true) { "OAuth state mismatch" }
-                val code = callback.getQueryParameter("code") ?: error(
-                    callback.getQueryParameter("error") ?: "Authorization code missing"
-                )
-                val issued = callback.getQueryParameter("client_id") ?: existing
-                    ?: error("Dynamic registration did not return a client_id")
-                require(issued != "dynamic_agent_client") { "Invalid OAuth client_id" }
-                prefs.edit().putString("client_id", issued).apply()
+                callback.getQueryParameter("error")?.let { error("Authorization failed: $it") }
+                val code = callback.getQueryParameter("code") ?: error("Authorization code missing")
+                val issued = OAuthProtocol.issuedClientId(existing, callback.getQueryParameter("client_id"))
                 val exchanged = postForm(TOKEN, mapOf(
                     "grant_type" to "authorization_code",
                     "client_id" to issued,
@@ -109,7 +147,8 @@ class ChatGptAuth(private val context: Context) {
                     "resource" to RESOURCE
                 ))
                 val identity = verifyIdToken(exchanged.getString("id_token"), issued, nonce)
-                require(exchanged.optString("scope").split(' ').contains("chatgpt.tokens.use.direct")) {
+                val grantedScope = exchanged.optString("scope")
+                require(OAuthProtocol.grantsChatGptPlan(grantedScope)) {
                     "ChatGPT plan usage permission was not granted"
                 }
                 val previous = crypto.load()
@@ -122,22 +161,24 @@ class ChatGptAuth(private val context: Context) {
                     .put("access_token", exchanged.getString("access_token"))
                     .put("refresh_token", exchanged.optString("refresh_token", ""))
                     .put("id_token", exchanged.getString("id_token"))
-                    .put("scope", exchanged.getString("scope"))
+                    .put("scope", grantedScope)
                     .put("saved_at", System.currentTimeMillis())
                     .put("expires_in", exchanged.optLong("expires_in", 3600L))
                 crypto.save(session)
-                handler.post { finished(Result.success(accountLabel)) }
+                prefs.edit().putString("client_id", issued).apply()
+                complete(Result.success(accountLabel))
             } catch (e: Exception) {
-                handler.post { finished(Result.failure(e)) }
+                complete(Result.failure(e))
             } finally {
                 try { listener.close() } catch (_: Exception) { }
+                if (activeListener === listener) activeListener = null
             }
         }
         try {
             activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE))
         } catch (e: Exception) {
             listener.close()
-            finished(Result.failure(e))
+            complete(Result.failure(e))
         }
     }
 
@@ -162,11 +203,12 @@ class ChatGptAuth(private val context: Context) {
             require(verified.getString("sub") == session.getString("subject")) { "Refresh account mismatch" }
             session.put("id_token", newId)
         }
-        val grantedScopes = response.optString("scope", session.getString("scope"))
-        require(grantedScopes.split(' ').contains("chatgpt.tokens.use.direct")) { "Plan access revoked" }
+        val grantedScopes = response.optString("scope").ifBlank { session.getString("scope") }
+        require(OAuthProtocol.grantsChatGptPlan(grantedScopes)) { "Plan access revoked" }
+        val rotatedRefreshToken = response.optString("refresh_token").ifBlank { refresh }
         session.put("scope", grantedScopes)
             .put("access_token", response.getString("access_token"))
-            .put("refresh_token", response.getString("refresh_token"))
+            .put("refresh_token", rotatedRefreshToken)
             .put("expires_in", response.optLong("expires_in", 3600L))
             .put("saved_at", System.currentTimeMillis())
         crypto.save(session)
@@ -174,13 +216,18 @@ class ChatGptAuth(private val context: Context) {
     }
 
     private fun awaitCallback(listener: ServerSocket): Uri {
+        val deadline = System.nanoTime() + 180_000_000_000L
+        var rejectedRequests = 0
         while (true) {
+            val remainingMillis = ((deadline - System.nanoTime()) / 1_000_000).toInt()
+            if (remainingMillis <= 0) error("OAuth callback timed out")
+            listener.soTimeout = remainingMillis.coerceAtLeast(1)
             listener.accept().use { socket ->
                 socket.soTimeout = 4000
-                val request = BufferedReader(InputStreamReader(socket.getInputStream())).readLine() ?: return@use
+                val request = readRequestLine(socket.getInputStream()) ?: return@use
                 val path = request.split(' ').getOrNull(1) ?: return@use
                 val matched = path.substringBefore('?') == "/auth/callback"
-                val payload = if (matched) "Authentication received. Return to GPT Bridge." else "Not found"
+                val payload = if (matched) "Authentication received. Return to Chabi." else "Not found"
                 val body = payload.toByteArray(StandardCharsets.UTF_8)
                 val status = if (matched) "200 OK" else "404 Not Found"
                 socket.getOutputStream().write((
@@ -189,8 +236,42 @@ class ChatGptAuth(private val context: Context) {
                 ).toByteArray(StandardCharsets.US_ASCII) + body)
                 socket.getOutputStream().flush()
                 if (matched) return Uri.parse("http://127.0.0.1$path")
+                if (++rejectedRequests >= 8) error("Too many invalid OAuth callback requests")
             }
         }
+    }
+
+    private fun readRequestLine(input: java.io.InputStream): String? {
+        val line = ByteArrayOutputStream()
+        while (line.size() <= 8192) {
+            val value = input.read()
+            if (value < 0 || value == '\n'.code) break
+            if (value != '\r'.code) line.write(value)
+        }
+        require(line.size() <= 8192) { "OAuth callback request is too large" }
+        return line.toString("US-ASCII").takeIf { it.isNotBlank() }
+    }
+
+    private fun revoke(session: JSONObject): Boolean {
+        val clientId = session.optString("client_id").takeIf { it.isNotBlank() } ?: return false
+        val token = session.optString("refresh_token").ifBlank { session.optString("access_token") }
+        if (token.isBlank()) return true
+        val metadata = getJson("https://auth.openai.com/.well-known/openid-configuration")
+        val endpoint = metadata.optString("revocation_endpoint")
+        if (!endpoint.startsWith("https://")) return false
+        val fields = linkedMapOf("token" to token, "client_id" to clientId)
+        if (session.optString("refresh_token").isNotBlank()) fields["token_type_hint"] = "refresh_token"
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        return try {
+            connection.instanceFollowRedirects = false
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 15000
+            connection.readTimeout = 15000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+            connection.outputStream.use { it.write(encode(fields).toByteArray(StandardCharsets.UTF_8)) }
+            connection.responseCode in 200..299
+        } finally { connection.disconnect() }
     }
 
     private fun verifyIdToken(token: String, clientId: String, nonce: String?): JSONObject {
@@ -273,6 +354,7 @@ object Http {
     private fun request(method: String, url: String, body: ByteArray?, type: String?, bearer: String?): JSONObject {
         val connection = URL(url).openConnection() as HttpURLConnection
         try {
+            connection.instanceFollowRedirects = false
             connection.requestMethod = method
             connection.connectTimeout = 15000
             connection.readTimeout = 45000
@@ -283,7 +365,19 @@ object Http {
                 connection.outputStream.use { it.write(body) }
             }
             val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            val text = stream?.use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(8192)
+                var total = 0
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    check(total <= 1_048_576) { "HTTP response exceeds size limit" }
+                    output.write(buffer, 0, count)
+                }
+                String(output.toByteArray(), StandardCharsets.UTF_8)
+            } ?: ""
             if (connection.responseCode !in 200..299) error("HTTP ${connection.responseCode}: ${text.take(300)}")
             return JSONObject(text)
         } finally { connection.disconnect() }

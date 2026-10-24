@@ -11,9 +11,13 @@ import java.util.zip.ZipInputStream
 
 object WakeModelInstaller {
     private const val MAX_UNPACKED_BYTES = 220L * 1024 * 1024
+    private val installLock = Any()
     fun modelDir(context: Context) = File(context.filesDir, "wake-model")
-    fun isInstalled(context: Context) = File(modelDir(context), "am/final.mdl").isFile &&
-        File(modelDir(context), "conf").isDirectory && File(modelDir(context), "graph").isDirectory
+    fun isInstalled(context: Context): Boolean = synchronized(installLock) {
+        recoverInterruptedInstall(context)
+        File(modelDir(context), "am/final.mdl").isFile &&
+            File(modelDir(context), "conf").isDirectory && File(modelDir(context), "graph").isDirectory
+    }
 
     fun install(context: Context, uri: Uri) {
         val input = context.contentResolver.openInputStream(uri) ?: error("Model archive not readable")
@@ -23,6 +27,7 @@ object WakeModelInstaller {
     fun downloadSmallEnglish(context: Context) {
         val archive = File(context.cacheDir, "vosk-model-small-en-us-0.15.zip")
         val connection = URL("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip").openConnection() as HttpURLConnection
+        connection.instanceFollowRedirects = false
         connection.connectTimeout = 15000
         connection.readTimeout = 60000
         try {
@@ -51,7 +56,8 @@ object WakeModelInstaller {
         }
     }
 
-    private fun installStream(context: Context, input: InputStream) {
+    private fun installStream(context: Context, input: InputStream) = synchronized(installLock) {
+        recoverInterruptedInstall(context)
         val target = modelDir(context)
         val staging = File(context.filesDir, "wake-model-staging")
         staging.deleteRecursively()
@@ -102,6 +108,16 @@ object WakeModelInstaller {
             previous.deleteRecursively()
         } finally {
             staging.deleteRecursively()
+        }
+    }
+
+    private fun recoverInterruptedInstall(context: Context) {
+        val target = modelDir(context)
+        val previous = File(context.filesDir, "wake-model-previous")
+        if (!target.exists() && previous.exists()) {
+            check(previous.renameTo(target)) { "Could not recover previous Vosk model" }
+        } else if (target.exists() && previous.exists()) {
+            previous.deleteRecursively()
         }
     }
 }

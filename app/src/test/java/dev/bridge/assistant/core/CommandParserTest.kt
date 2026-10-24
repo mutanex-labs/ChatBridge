@@ -18,4 +18,11 @@ class CommandParserTest {
         assertEquals(LocalCommand.AskGpt, CommandParser.parse("объясни этот экран"))
         assertEquals(LocalCommand.AskGpt, CommandParser.parse(""))
     }
+
+    @Test fun trimsWhitespaceAndRejectsIncompleteCommands() {
+        assertEquals(LocalCommand.Call("маме"), CommandParser.parse("  ПОЗВОНИ   маме  "))
+        assertEquals(LocalCommand.AskGpt, CommandParser.parse("позвони"))
+        assertEquals(LocalCommand.AskGpt, CommandParser.parse("открой"))
+        assertEquals(LocalCommand.AskGpt, CommandParser.parse("запиши в заметки"))
+    }
 }

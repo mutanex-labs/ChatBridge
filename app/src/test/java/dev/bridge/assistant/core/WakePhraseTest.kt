@@ -16,5 +16,6 @@ class WakePhraseTest {
         assertFalse(WakePhrase.matches("open settings"))
         assertFalse(WakePhrase.matches("gpt models"))
         assertFalse(WakePhrase.matches(""))
+        assertFalse(WakePhrase.matches("opening gpt"))
     }
 }

@@ -9,8 +9,6 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
-import kotlin.math.ceil
-import kotlin.math.floor
 
 class ScreenLasso(context: Context) : View(context) {
     private var screenshot: Bitmap? = null
@@ -21,79 +19,115 @@ class ScreenLasso(context: Context) : View(context) {
         style = Paint.Style.STROKE
     }
     private val trace = Path()
-    private val coords = mutableListOf<Pair<Float, Float>>()
+    private val coords = mutableListOf<LassoPoint>()
     private var displayRect = RectF()
+    private var drawing = false
+    private var completed = false
 
     fun setScreenshot(image: Bitmap?) {
         screenshot = image
+        clearSelection()
+        updateDisplayRect()
+        invalidate()
+    }
+
+    private fun clearSelection() {
         trace.reset()
         coords.clear()
-        invalidate()
+        drawing = false
+        completed = false
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        updateDisplayRect()
+        clearSelection()
+    }
+
+    private fun updateDisplayRect() {
+        val source = screenshot
+        if (source == null || width <= 0 || height <= 0 || source.width <= 0 || source.height <= 0) {
+            displayRect.setEmpty()
+            return
+        }
+        val scale = minOf(width.toFloat() / source.width, height.toFloat() / source.height)
+        val w = source.width * scale
+        val h = source.height * scale
+        displayRect.set((width - w) / 2f, (height - h) / 2f, (width + w) / 2f, (height + h) / 2f)
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         canvas.drawColor(Color.rgb(32, 35, 43))
         val source = screenshot ?: return
-        val scale = minOf(width.toFloat() / source.width, height.toFloat() / source.height)
-        val w = source.width * scale
-        val h = source.height * scale
-        displayRect = RectF((width - w) / 2f, (height - h) / 2f, (width + w) / 2f, (height + h) / 2f)
-        canvas.drawBitmap(source, null, displayRect, screenPaint)
+        if (displayRect.isEmpty) updateDisplayRect()
+        if (!displayRect.isEmpty) canvas.drawBitmap(source, null, displayRect, screenPaint)
         if (coords.isNotEmpty()) canvas.drawPath(trace, linePaint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (screenshot == null) return false
-        if (event.actionMasked == MotionEvent.ACTION_DOWN && !displayRect.contains(event.x, event.y)) return false
+        if (screenshot == null || displayRect.isEmpty) return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                coords.clear()
-                trace.reset()
+                if (!displayRect.contains(event.x, event.y)) return false
+                clearSelection()
+                drawing = true
+                coords.add(LassoPoint(event.x, event.y))
                 trace.moveTo(event.x, event.y)
-                coords.add(event.x to event.y)
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                val x = event.x.coerceIn(displayRect.left, displayRect.right)
-                val y = event.y.coerceIn(displayRect.top, displayRect.bottom)
-                coords.add(x to y)
-                trace.lineTo(x, y)
+                if (!drawing) return false
+                for (index in 0 until event.historySize) addPoint(event.getHistoricalX(index), event.getHistoricalY(index))
+                addPoint(event.x, event.y)
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                trace.close()
+                if (!drawing) return false
+                addPoint(event.x, event.y)
+                drawing = false
+                completed = coords.size >= 3
+                if (completed) trace.close() else clearSelection()
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                clearSelection()
                 invalidate()
                 return true
             }
         }
-        return true
+        return drawing
+    }
+
+    private fun addPoint(x: Float, y: Float) {
+        val clampedX = x.coerceIn(displayRect.left, displayRect.right)
+        val clampedY = y.coerceIn(displayRect.top, displayRect.bottom)
+        coords.add(LassoPoint(clampedX, clampedY))
+        trace.lineTo(clampedX, clampedY)
     }
 
     fun selectedBitmap(): Bitmap? {
         val original = screenshot ?: return null
-        if (coords.size < 3 || displayRect.width() <= 0f || displayRect.height() <= 0f) return null
-        val factorX = original.width / displayRect.width()
-        val factorY = original.height / displayRect.height()
-        val bitmapPoints = coords.map { ((it.first - displayRect.left) * factorX) to ((it.second - displayRect.top) * factorY) }
-        val left = floor(bitmapPoints.minOf { it.first }).toInt().coerceIn(0, original.width - 1)
-        val top = floor(bitmapPoints.minOf { it.second }).toInt().coerceIn(0, original.height - 1)
-        val right = ceil(bitmapPoints.maxOf { it.first }).toInt().coerceIn(left + 1, original.width)
-        val bottom = ceil(bitmapPoints.maxOf { it.second }).toInt().coerceIn(top + 1, original.height)
-        if (right - left < 16 || bottom - top < 16) return null
-        val path = Path()
-        bitmapPoints.forEachIndexed { index, (x, y) ->
-            if (index == 0) path.moveTo(x - left, y - top) else path.lineTo(x - left, y - top)
+        if (!completed || drawing) return null
+        val selection = LassoGeometry.resolve(width, height, original.width, original.height, coords) ?: return null
+        val crop = selection.crop
+        val path = Path().apply {
+            selection.points.forEachIndexed { index, point ->
+                val x = point.x - crop.left
+                val y = point.y - crop.top
+                if (index == 0) moveTo(x, y) else lineTo(x, y)
+            }
+            close()
         }
-        path.close()
-        val output = Bitmap.createBitmap(right - left, bottom - top, Bitmap.Config.ARGB_8888)
-        Canvas(output).apply {
-            drawColor(Color.WHITE)
-            clipPath(path)
-            drawBitmap(original, -left.toFloat(), -top.toFloat(), screenPaint)
+        return Bitmap.createBitmap(crop.width, crop.height, Bitmap.Config.ARGB_8888).also { output ->
+            Canvas(output).apply {
+                drawColor(Color.WHITE)
+                clipPath(path)
+                drawBitmap(original, -crop.left.toFloat(), -crop.top.toFloat(), screenPaint)
+            }
         }
-        return output
     }
 }

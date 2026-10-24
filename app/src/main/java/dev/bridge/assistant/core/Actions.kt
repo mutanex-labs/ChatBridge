@@ -3,12 +3,15 @@ package dev.bridge.assistant.core
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.ContactsContract
 
 class Actions(private val activity: Activity, private val report: (String) -> Unit) {
+    private data class ContactRow(val name: String, val number: String)
+
     fun run(command: LocalCommand) {
         when (command) {
             is LocalCommand.Call -> call(command.contact)
@@ -20,29 +23,34 @@ class Actions(private val activity: Activity, private val report: (String) -> Un
 
     private fun call(name: String) {
         if (activity.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
-            activity.requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE), 101)
-            report("Grant contacts and call permissions, then repeat the command")
+            activity.requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 101)
+            report("Grant contacts permission, then repeat the command")
             return
         }
-        val candidates = mutableListOf<Pair<String, String>>()
+        val candidates = mutableListOf<ContactRow>()
         val columns = arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
             ContactsContract.CommonDataKinds.Phone.NUMBER)
         activity.contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, columns,
-            "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} LIKE ?",
-            arrayOf("%${name.removeSuffix("е").trim()}%"), null)?.use { cursor ->
-            while (cursor.moveToNext() && candidates.size < 30) {
-                candidates += cursor.getString(0) to cursor.getString(1)
+            null, null, "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} COLLATE NOCASE ASC")?.use { cursor ->
+            while (cursor.moveToNext() && candidates.size <= MAX_CONTACT_ROWS) {
+                val displayName = cursor.getString(0).orEmpty()
+                val number = cursor.getString(1).orEmpty()
+                if (displayName.isNotBlank() && number.isNotBlank()) candidates += ContactRow(displayName, number)
             }
         }
-        if (candidates.isEmpty()) {
+        if (candidates.size > MAX_CONTACT_ROWS) {
+            report("Too many contacts to resolve safely. Use a more specific contact name.")
+            return
+        }
+        val matches = ContactResolver.matching(name, candidates.map { ContactNumber(it.name, it.number) })
+        if (matches.isEmpty()) {
             report("Contact '$name' was not found. Save it under this name or use the exact contact name.")
             return
         }
-        val distinct = candidates.distinct()
-        if (distinct.size == 1) dial(distinct[0].second)
+        if (matches.size == 1) dial(matches[0].number)
         else AlertDialog.Builder(activity).setTitle("Choose contact")
-            .setItems(distinct.map { "${it.first}: ${it.second}" }.toTypedArray()) { _, index ->
-                dial(distinct[index].second)
+            .setItems(matches.map { "${it.displayName}: ${it.number}" }.toTypedArray()) { _, index ->
+                if (index in matches.indices) dial(matches[index].number)
             }.show()
     }
 
@@ -53,11 +61,23 @@ class Actions(private val activity: Activity, private val report: (String) -> Un
                 activity.startActivity(Intent(Intent.ACTION_CALL, uri))
                 report("Calling")
             } catch (e: SecurityException) {
-                activity.startActivity(Intent(Intent.ACTION_DIAL, uri))
+                openDialer(uri)
+            } catch (e: ActivityNotFoundException) {
+                report("No phone app can place this call")
             }
         } else {
+            openDialer(uri)
+        }
+    }
+
+    private fun openDialer(uri: Uri) {
+        try {
             activity.startActivity(Intent(Intent.ACTION_DIAL, uri))
-            report("Opened the dialer. Grant call permission to call directly.")
+            report("Opened the dialer. Confirm the call there.")
+        } catch (_: ActivityNotFoundException) {
+            report("No phone app can open the dialer")
+        } catch (_: SecurityException) {
+            report("The phone app could not be opened")
         }
     }
 
@@ -71,8 +91,14 @@ class Actions(private val activity: Activity, private val report: (String) -> Un
         }
         fun launch(index: Int) {
             val app = matches[index].activityInfo
-            activity.startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-                .setClassName(app.packageName, app.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            try {
+                activity.startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                    .setClassName(app.packageName, app.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (_: ActivityNotFoundException) {
+                report("The selected app is no longer available")
+            } catch (_: SecurityException) {
+                report("Android blocked the selected app from opening")
+            }
         }
         if (matches.size == 1) launch(0) else AlertDialog.Builder(activity).setTitle("Choose app")
             .setItems(matches.map { it.loadLabel(pm).toString() }.toTypedArray()) { _, i -> launch(i) }.show()
@@ -92,5 +118,9 @@ class Actions(private val activity: Activity, private val report: (String) -> Un
                 val intent = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, body) }
                 activity.startActivity(Intent.createChooser(intent, "Выберите приложение заметок"))
             }.setNegativeButton("Оставить локально", null).show()
+    }
+
+    private companion object {
+        const val MAX_CONTACT_ROWS = 5000
     }
 }

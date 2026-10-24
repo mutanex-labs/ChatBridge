@@ -8,6 +8,7 @@ import android.net.Uri
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Build
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -19,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
+import android.graphics.Bitmap
 import dev.bridge.assistant.assistant.ScreenBuffer
 import dev.bridge.assistant.assistant.WakeWordService
 import dev.bridge.assistant.assistant.WakeEvents
@@ -41,10 +43,12 @@ class MainActivity : Activity() {
     private var activatedByWake = false
     private var rearmOnResume = false
     private var activityResumed = false
+    private var pendingScreen: Bitmap? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         auth = ChatGptAuth(applicationContext)
+        pendingScreen = if (intent.getBooleanExtra("screen_selection", false)) ScreenBuffer.takeSelection() else null
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(28, 28, 28, 28)
@@ -57,17 +61,27 @@ class MainActivity : Activity() {
             setOnClickListener { callback() }
             root.addView(this)
         }
-        root.addView(label("GPT Bridge · Android assistant").apply { textSize = 24f })
+        root.addView(label("Chabi · Android assistant").apply { textSize = 24f })
         status = label("Account: ${auth.accountLabel}")
         root.addView(status)
         button("Continue with ChatGPT") {
             status.text = "Opening the system browser…"
             auth.begin(this) { result ->
-                result.fold(onSuccess = { status.text = "Connected: $it"; refreshModels() },
+                if (!isFinishing && !isDestroyed) result.fold(
+                    onSuccess = { status.text = "Connected: $it"; refreshModels() },
                     onFailure = { status.text = "Sign-in failed: ${it.message}" })
             }
         }
-        button("Disconnect account") { auth.signOut(); modelIds = emptyList(); status.text = "Disconnected" }
+        button("Disconnect account") {
+            modelIds = emptyList()
+            status.text = "Disconnecting account locally…"
+            auth.signOut { revoked ->
+                if (!isFinishing && !isDestroyed) {
+                    status.text = if (revoked) "Disconnected; remote token revocation confirmed"
+                    else "Disconnected locally; remote token revocation could not be confirmed"
+                }
+            }
+        }
         root.addView(label("Model (from signed-in account):"))
         modelPicker = Spinner(this)
         root.addView(modelPicker)
@@ -84,7 +98,7 @@ class MainActivity : Activity() {
             confirmSelectedScreen()
         }
         root.addView(label("Open GPT: локальная офлайн-активация, включается вручную. Микрофон работает постоянно, расходует батарею."))
-        button("Назначить GPT Bridge системным ассистентом") {
+        button("Назначить Chabi системным ассистентом") {
             val manager = getSystemService(RoleManager::class.java)
             if (manager.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
                 startActivityForResult(manager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT), 104)
@@ -117,8 +131,8 @@ class MainActivity : Activity() {
             stopService(Intent(this, WakeWordService::class.java))
             status.text = "Open GPT выключен"
         }
-        root.addView(label("Для Open GPT сначала назначьте GPT Bridge системным ассистентом и импортируйте Vosk small English model."))
-        if (intent.getBooleanExtra("screen_selection", false)) {
+        root.addView(label("Для Open GPT сначала назначьте Chabi системным ассистентом и импортируйте Vosk small English model."))
+        if (pendingScreen != null) {
             input.setText("Объясни выделенную область экрана")
             confirmSelectedScreen()
         }
@@ -130,7 +144,7 @@ class MainActivity : Activity() {
     }
 
     private fun confirmSelectedScreen() {
-        if (ScreenBuffer.bitmap == null) {
+        if (pendingScreen == null) {
             status.text = "Android не предоставил снимок экрана"
             return
         }
@@ -138,21 +152,38 @@ class MainActivity : Activity() {
             .setTitle("Отправить изображение в GPT?")
             .setMessage("Выбранная область будет отправлена в OpenAI после подтверждения. Не отправляйте личные данные.")
             .setPositiveButton("Отправить") { _, _ ->
-                askGpt(input.text.toString().ifBlank { "Объясни, что показано на экране" }, true)
+                val image = pendingScreen
+                pendingScreen = null
+                askGpt(input.text.toString().ifBlank { "Объясни, что показано на экране" }, image)
             }
-            .setNegativeButton("Отмена", null).show()
+            .setNegativeButton("Отмена") { _, _ -> discardPendingScreen() }
+            .setOnCancelListener { discardPendingScreen() }
+            .show()
+    }
+
+    private fun discardPendingScreen() {
+        pendingScreen?.let { if (!it.isRecycled) it.recycle() }
+        pendingScreen = null
     }
 
     private fun enableWakeWord() {
         val role = getSystemService(RoleManager::class.java)
         if (!role.isRoleAvailable(RoleManager.ROLE_ASSISTANT) || !role.isRoleHeld(RoleManager.ROLE_ASSISTANT)) {
-            status.text = "Назначьте GPT Bridge ассистентом Android, иначе голосовой вызов не сможет показать сессию"
+            status.text = "Назначьте Chabi ассистентом Android, иначе голосовой вызов не сможет показать сессию"
             return
         }
         if (!WakeModelInstaller.isInstalled(this)) {
             status.text = "Сначала импортируйте ZIP-модель Vosk"
             return
         }
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 105)
+            return
+        }
+        continueEnableWakeWord()
+    }
+
+    private fun continueEnableWakeWord() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingWakePermission = true
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 102)
@@ -186,6 +217,8 @@ class MainActivity : Activity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (intent.getBooleanExtra("screen_selection", false)) {
+            discardPendingScreen()
+            pendingScreen = ScreenBuffer.takeSelection()
             input.setText("Объясни выделенную область экрана")
             confirmSelectedScreen()
         }
@@ -237,23 +270,28 @@ class MainActivity : Activity() {
     private fun executeCommand(text: String) {
         if (text.isBlank()) { status.text = "Enter or speak a command"; return }
         when (val command = CommandParser.parse(text)) {
-            LocalCommand.AskGpt -> askGpt(text, false)
+            LocalCommand.AskGpt -> askGpt(text)
             else -> try { Actions(this) { status.text = it }.run(command) }
                 catch (e: Exception) { status.text = "Action failed: ${e.message}" }
         }
     }
 
-    private fun askGpt(text: String, withImage: Boolean) {
+    private fun askGpt(text: String, image: Bitmap? = null) {
         val model = modelIds.getOrNull(modelPicker.selectedItemPosition)
-        if (model == null) { status.text = "Connect ChatGPT and select a model first"; return }
+        if (model == null) {
+            image?.let { if (!it.isRecycled) it.recycle() }
+            status.text = "Connect ChatGPT and select a model first"
+            return
+        }
         status.text = "Requesting $model…"
-        val image = if (withImage) ScreenBuffer.bitmap else null
         io.execute {
             try {
                 val result = GptClient(auth).ask(model, text, image)
                 runOnUiThread { status.text = result.ifBlank { "Empty model response" } }
             } catch (e: Exception) {
                 runOnUiThread { status.text = "GPT request failed: ${e.message}" }
+            } finally {
+                image?.let { if (!it.isRecycled) it.recycle() }
             }
         }
     }
@@ -321,10 +359,20 @@ class MainActivity : Activity() {
                 enableWakeWord()
             } else startSpeech()
         } else if (requestCode == 102) pendingWakePermission = false
+        if (requestCode == 105) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) continueEnableWakeWord()
+            else {
+                status.text = "Уведомления запрещены; сервис будет виден в системном списке активных приложений"
+                continueEnableWakeWord()
+            }
+        }
     }
 
     override fun onDestroy() {
         recognizer?.destroy()
+        discardPendingScreen()
+        ScreenBuffer.clear()
+        auth.close()
         io.shutdownNow()
         super.onDestroy()
     }
