@@ -36,4 +36,4 @@ Vosk models and license: https://alphacephei.com/vosk/models.html
 
 Vosk Maven: https://central.sonatype.com/artifact/com.alphacephei/vosk-android/0.3.47
 
-This project is not affiliated with, endorsed by or approved by OpenAI or Xiaomi.
+This is an independent, unofficial project. It is not affiliated with or endorsed by OpenAI.
